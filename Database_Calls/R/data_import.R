@@ -11,9 +11,10 @@ library(odbc)
 require(rlang)    # tidy programming extentsion
 require(magrittr) # tidy programming extentsion
 require(glue)     # alternative to paste()
-
+require(zoo) # for na._ funstions
 require(datamodelr) # package to graphically desplay daabase structure
-
+require(lubridate)
+require(hms)
 #Open Connection
 con <- DBI::dbConnect(odbc::odbc(), "alantic_seabirds", database = "atlantic_seabirds")
 
@@ -51,32 +52,55 @@ front_winter_effort <- vw_winter_front_DesignFlown %>%
 # Pull GpsTrack_point with above EffortId
 frnt_wntr_trck_pnts <- tbl(con, "GpsTrack_point") %>%
   filter(EffortId %in% front_winter_effort$EffortId) %>%
-  select(EffortId, SecondsFromMidnight, longitude_dd, latitude_dd,
-         GpsError, PointType, ConditionCode) %>%
+  select(EffortId, SecondsFromMidnight,
+         longitude_dd, latitude_dd,
+         GpsError, ConditionCode,
+         PointType) %>%
   collect()
+
+# Pull Track information from observation table
+frnt_wntr_obsv_pnts <- tbl(con, "Observation") %>%
+  filter(EffortId %in% front_winter_effort$EffortId) %>%
+  select(EffortId, SecondsFromMidnight = Time_secs,
+         longitude_dd, latitude_dd,
+         GpsError, ConditionCode) %>%
+  collect()
+
+# Add Observation tracks to GpsTrack_point data
+frnt_wntr_trck_pnts %<>% full_join(frnt_wntr_obsv_pnts,
+                                   by = c("EffortId", "SecondsFromMidnight",
+                                          "longitude_dd", "latitude_dd",
+                                          "GpsError", "ConditionCode")) %>%
+  mutate(PointType = na.fill(PointType, "WAYPNT")) #Do we want to make these "OBSRVTN" ?? wayp points that are also observations will be recorded as WAYPNT
 
 # Pull from Observation table
 frnt_wntr_obs <- tbl(con, "Observation") %>%
   filter(EffortId %in% front_winter_effort$EffortId) %>%
   filter(SpeciesId %in% c("BLSC", "LTDU", "BUFF", "MERG",
                           "RBME", "COGO", "SUSC", "SCOT",
-                          "DUCK", "WWSC", "COEI", "COME",
+                          "WWSC", "COEI", "COME",
                           "HOME", "BAGO", "GOLD", "DWSC",
-                          "GOME", "HARD", "UNDD", "EIDE")) %>%
-  select(ObservationId, EffortId, SpeciesId,
+                          "GOME", "HARD", "EIDE")) %>%
+  select(EffortId, SpeciesId,
          longitude_dd, latitude_dd, Count) %>%
   collect()
+
+
 
 DBI::dbDisconnect(con)
 
 
-# Simplify to an observation and track view with Design and Effort ids
-vw_trk <- left_join(frnt_wntr_trck_pnts, front_winter_effort, by = "EffortId")
-vw_obs <- left_join(frnt_wntr_obs,       front_winter_effort, by = "EffortId")
+# # Simplify to an observation and track view with Design and Effort ids
+# vw_trk <- left_join(frnt_wntr_trck_pnts, front_winter_effort, by = "EffortId")
+# vw_obs <- left_join(frnt_wntr_obs,       front_winter_effort, by = "EffortId")
 
-# I have determined that observations were not included as track points.
-# So... we need to join these views to get all our useful points in one place to be ordered.
 
-pre_track_frag <- full_join(vw_trk, vw_obs,
+pre_track_frag <- full_join(frnt_wntr_trck_pnts, frnt_wntr_obs,
                             by = c("EffortId", "longitude_dd",
-                                   "latitude_dd", "DesignId", "Seat"))
+                                   "latitude_dd"))
+
+
+
+dm_f <- dm_from_data_frames(pre_track_frag)
+final_data <- dm_create_graph(dm_f)
+dm_render_graph(final_data)
