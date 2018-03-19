@@ -56,7 +56,7 @@ frnt_wntr_trck_pnts <- tbl(con, "GpsTrack_point") %>%
          longitude_dd, latitude_dd,
          GpsError, ConditionCode,
          PointType) %>%
-  collect()
+  collect() %>% distinct
 
 # Pull Track information from observation table
 frnt_wntr_obsv_pnts <- tbl(con, "Observation") %>%
@@ -64,15 +64,15 @@ frnt_wntr_obsv_pnts <- tbl(con, "Observation") %>%
   select(EffortId, SecondsFromMidnight = Time_secs,
          longitude_dd, latitude_dd,
          GpsError, ConditionCode) %>%
-  collect()
+  collect() %>% distinct
 
 # Add Observation tracks to GpsTrack_point data
 frnt_wntr_trck_pnts %<>% full_join(frnt_wntr_obsv_pnts,
                                    by = c("EffortId", "SecondsFromMidnight",
                                           "longitude_dd", "latitude_dd",
                                           "GpsError", "ConditionCode")) %>%
-  mutate(PointType = na.fill(PointType, "WAYPNT")) #Do we want to make these "OBSRVTN" ?? wayp points that are also observations will be recorded as WAYPNT
-
+  mutate(PointType = na.fill(PointType, "WAYPNT")) %>% #Do we want to make these "OBSRVTN" ?? wayp points that are also observations will be recorded as WAYPNT
+  distinct
 # Pull from Observation table
 frnt_wntr_obs <- tbl(con, "Observation") %>%
   filter(EffortId %in% front_winter_effort$EffortId) %>%
@@ -83,7 +83,11 @@ frnt_wntr_obs <- tbl(con, "Observation") %>%
                           "GOME", "HARD", "EIDE")) %>%
   select(EffortId, SpeciesId,
          longitude_dd, latitude_dd, Count) %>%
-  collect()
+  collect() %>%
+  group_by(EffortId, SpeciesId,
+           longitude_dd, latitude_dd) %>%
+  summarise(Count = sum(Count))
+
 
 
 
