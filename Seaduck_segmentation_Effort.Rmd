@@ -1,0 +1,158 @@
+---
+title: "Segmentation of Seabird sites"
+output: html_notebook
+---
+
+```{r}
+# Call Libraries and connect----
+library(tidyverse) # tidyverse functionality
+require(DBI)       # for relational databases
+library(odbc)
+require(rlang)    # tidy programming extentsion
+require(magrittr) # tidy programming extentsion
+require(glue)     # alternative to paste()
+require(zoo) # for na._ funstions
+require(datamodelr) # package to graphically desplay daabase structure
+require(lubridate)
+require(hms)
+require(sf)
+```
+
+# Call track data for segmentation from DB
+First, we need to identify Winter DesignId. Then identify EffortId corresponding to Winter surveys.  Pull both the track and observation points for those EffortID, group by DesignId and ReplicateNumber (need to check that EffortID and ReplicateNumber are not repeated on multiple datesFlown) 
+```{r}
+#Open Connection
+con <- DBI::dbConnect(odbc::odbc(), "alantic_seabirds", database = "atlantic_seabirds")
+
+#Create filters ----
+#Creat Design Flown by Season list
+Winter_Survey_id <- tbl(con, "SurveyMap") %>%
+  filter(Season == "Winter") %>%
+  select(SurveyId) %>%
+  collect()
+Winter_Design_id <- tbl(con, "DesignPlan") %>%
+  filter(SurveyId %in% Winter_Survey_id$SurveyId) %>%
+  select(DesignId) %>%
+  collect()
+rm(Winter_Survey_id)
+
+#Filter Effort Ids
+vw_winter_DesignFlown <- tbl(con, "DesignFlown") %>%
+  filter(DesignId %in% Winter_Design_id$DesignId) %>%
+  select(EffortId, DesignId, dateFlown, ReplicateNumber) %>%
+  collect()
+rm(Winter_Design_id)
+
+# Pull GpsTrack_point with above EffortId
+wntr_trck_pnts <- tbl(con, "GpsTrack_point") %>%
+  filter(EffortId %in% vw_winter_DesignFlown$EffortId) %>%
+  select(EffortId, SecondsFromMidnight,
+         longitude_dd, latitude_dd,
+         GpsError, ConditionCode,
+         PointType) %>%
+  collect() %>% distinct
+
+# Pull Track information from observation table
+wntr_obsv_pnts <- tbl(con, "Observation") %>%
+  filter(EffortId %in% vw_winter_DesignFlown$EffortId) %>%
+  select(EffortId, SecondsFromMidnight = Time_secs,
+         longitude_dd, latitude_dd,
+         GpsError, ConditionCode) %>%
+  collect() %>% distinct
+
+# Add Observation tracks to GpsTrack_point data
+wntr_trck_pnts %<>% full_join(wntr_obsv_pnts,
+                                   by = c("EffortId", "SecondsFromMidnight",
+                                          "longitude_dd", "latitude_dd",
+                                          "GpsError", "ConditionCode")) %>%
+  mutate(PointType = na.fill(PointType, "WAYPNT")) %>% 
+  distinct
+rm(wntr_obsv_pnts)
+
+DBI::dbDisconnect(con)
+
+# The GpsErrors may be important but I can't figure them out
+# We are not worried about COCH for this project
+# 
+
+wntr_trck_pnts %<>% select("EffortId", "SecondsFromMidnight", "longitude_dd", "latitude_dd", "PointType") %>%
+  mutate(
+    PointType = if_else(PointType == "COCH", "WAYPNT", PointType)
+  ) %>% distinct
+
+# To avoid timestamp issues for this project all we need is the direction of flight not SecondsFromMidnight
+# 
+
+wntr_trck_pnts_WtoE <- wntr_trck_pnts %>% 
+  arrange(EffortId, SecondsFromMidnight) %>%
+  group_by(EffortId) %>%
+  mutate(
+    WtoE = if_else(longitude_dd <= lead(longitude_dd), 1, -1) %>%
+      sum(na.rm = TRUE) %>% sign
+    ) %>%
+  ungroup %>%
+  select(-SecondsFromMidnight) %>% distinct
+rm(wntr_trck_pnts)
+
+
+```
+
+
+# Create sub_track objects
+## Organize tracks
+```{r}
+# Combine with DesignId, dateflown, ReplicateNum
+# 
+winter_DesignFlown_pnts <- left_join(vw_winter_DesignFlown, wntr_trck_pnts_WtoE, by = "EffortId") 
+rm(vw_winter_DesignFlown, wntr_trck_pnts_WtoE) 
+winter_DesignFlown_pnts %<>% mutate(new_id = glue('{DesignId}_on_{dateFlown}_rep_{ReplicateNumber}'))
+
+pre_fragments <- winter_DesignFlown_pnts %>% 
+  select(new_id, longitude_dd, latitude_dd, WtoE) %>% distinct %>%
+  arrange(new_id, WtoE * longitude_dd) %>%
+  group_by(new_id)
+```
+
+## Create "fragments"
+```{r}
+track_fragments_tmp <- pre_fragments %>% 
+  select(new_id, 
+         lon = longitude_dd,
+         lat = latitude_dd,
+         WtoE) %>%
+  arrange(new_id, WtoE * lon) %>%
+  group_by(new_id) %>%
+  mutate(
+    effort_order = order(row_number())
+  )
+  
+track_fragments <- track_fragments_tmp %>%
+  mutate(
+    lon_tmp = lag(lon),
+    lat_tmp = lag(lat),
+    lon = na.fill(lon_tmp, lon),
+    lat = na.fill(lat_tmp, lat)) %>%
+  select(-lon_tmp, -lat_tmp) %>%
+  bind_rows(track_fragments_tmp) %>%
+  arrange(new_id, WtoE * lon, effort_order) %>%
+  st_as_sf(coords = c("lon", "lat")) %>%
+  group_by( new_id, WtoE, effort_order) %>% 
+  summarise(do_union = FALSE) %>% 
+  st_cast("LINESTRING")
+
+fragments <-  track_fragments %>% st_set_crs(4326) %>%
+  mutate( dist = st_length(geometry))
+  
+```
+
+
+
+# Add efforts
+
+# Add Observations
+
+# Check efforts / obs for consistency
+
+# Segment tracks
+
+# Summarise Data

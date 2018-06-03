@@ -1,0 +1,152 @@
+---
+title: "Step by Step Processing to Segment Data for sea duck key sites"
+output: html_notebook
+---
+
+```{r call libraries}
+# Call Libraries and connect----
+library(tidyverse) # tidyverse functionality
+require(DBI)       # for relational databases
+library(odbc)
+require(rlang)    # tidy programming extentsion
+require(magrittr) # tidy programming extentsion
+require(glue)     # alternative to paste()
+require(zoo) # for na._ funstions
+require(datamodelr) # package to graphically desplay daabase structure
+require(lubridate)
+require(hms)
+require(sf)
+#Open Connection
+con <- DBI::dbConnect(odbc::odbc(), "alantic_seabirds", database = "atlantic_seabirds")
+```
+
+
+```{r Narrow Focus}
+#Collect Winter Survey and Design Info
+SurveyMap_wntr <- tbl(con, "SurveyMap") %>%
+  filter(Season == "Winter") %>%
+  collect()
+Survey_wntr <- tbl(con, "Survey") %>%
+  filter( SurveyProgramId %in% SurveyMap_wntr$SurveyProgramId) %>%
+  collect()
+
+
+DesignPlan_wntr <- tbl(con, "DesignPlan") %>%
+  filter(SurveyId %in% SurveyMap_wntr$SurveyId) %>%
+  collect()
+
+#Collect winter transect info
+Transect_wntr <- tbl(con, "Transect") %>%
+  filter(TransectNum %in% DesignPlan_wntr$TransectId) %>%
+  filter(EastWestCode %in% DesignPlan_wntr$EastWestCode) %>%
+  filter(RevisionNum %in% DesignPlan_wntr$RevisionNum) %>%
+  select(-c(geom_line, geom_polygon)) %>% 
+  collect()
+
+#Collect winter design flown info
+DesignFlown_wntr <- tbl(con, "DesignFlown") %>% 
+  filter(DesignId %in% DesignPlan_wntr$DesignId) %>%
+  select(-c(geom_line, AircraftId, AvgConditionIndex)) %>% 
+  collect()
+
+
+
+#Collect winter front crew Info
+FlightCrew_wntr_frnt <- tbl(con, "FlightCrew") %>%
+  filter(CrewMemberRoleId %in% DesignFlown_wntr$CrewMemberRoleId) %>%
+  filter(Seat %in% c("LF", "RF")) %>%
+  select(-c(CrewId, CrewMemberId)) %>% 
+  collect()
+
+DesignFlown_wntr %<>% left_join(FlightCrew_wntr_frnt) %>%
+  select(-CrewMemberRoleId)
+
+rm(FlightCrew_wntr_frnt)
+
+#Collect GpsTrack_point wntr
+GpsTrack_point_wntr <-  tbl(con, "GpsTrack_point") %>%
+  filter(EffortId %in% DesignFlown_wntr$EffortId) %>%
+  select(-c(ConditionCode, geom_point, SecondsFromMidnight)) %>%
+  collect()
+
+#Collect winter observations
+
+Observation_wntr <- tbl(con, "Observation") %>%
+  filter(EffortId %in% DesignFlown_wntr$EffortId) %>%
+  select(-c(ConditionCode, geom_point, surveyband, Distance_nm, Time_secs)) %>% 
+  collect()
+  
+
+DBI::dbDisconnect(con)
+
+#Narrow observations
+Observation_wntr_sdck <- Observation_wntr %>%
+  filter(SpeciesId %in% c("BLSC", "LTDU", "BUFF", "MERG",
+                          "RBME", "COGO", "SUSC", "SCOT",
+                          "WWSC", "COEI", "COME",
+                          "HOME", "BAGO", "GOLD", "DWSC",
+                          "GOME", "HARD", "EIDE"))
+
+Observation_trck <- Observation_wntr %>%
+  select(-c(ObservationId, SpeciesId, Count))
+
+Track_trck <- GpsTrack_point_wntr %>% select(-PointType)
+
+Track_pnts <- GpsTrack_point_wntr
+
+rm(GpsTrack_point_wntr)
+```
+
+```{r combine track points and observation points}
+DesignFlown_trcks <- full_join(Track_trck, Observation_trck) %>%
+  left_join(DesignFlown_wntr) %>%
+  select(-EffortId, -Seat) %>% distinct
+
+Observation_wntr_sdck <- left_join(Observation_wntr_sdck,DesignFlown_wntr) %>%
+  select(-EffortId)
+
+Effort_pnts <- Track_pnts %>% filter(PointType != "WAYPNT") %>% left_join(DesignFlown_wntr) %>%
+  select(-EffortId)
+
+#Track_obs <- full_join(DesignFlown_pnts, DesignFlown_crew_frnt_wntr_sdck)
+```
+
+So now we should be able to segment the DesignFlown_pnts and later attach the join the observations
+But if an observation falls outside of a count we will run into the same problems as before!
+
+For now we are going to segment and worry about the observations later.
+
+```{r attempt at ordering by longitude}
+library(geosphere)
+track_ordered <- DesignFlown_trcks %>% 
+  rename(pos_lon = longitude_dd, pos_lat = latitude_dd) %>%
+  arrange(DesignId, dateFlown, ReplicateNumber, pos_lon) %>%
+  group_by(DesignId, dateFlown, ReplicateNumber) %>%
+  mutate(
+    ant_lon = lag(pos_lon),
+    ant_lat = lag(pos_lat),
+    ant_lon = na.fill(ant_lon, pos_lon),
+    ant_lat = na.fill(ant_lat, pos_lat)
+  ) %>%
+  ungroup %>%
+  rowwise %>%
+  mutate(ant_2_pos = distm(c(ant_lon, ant_lat), c(pos_lon, pos_lat), fun = distHaversine))
+
+```
+
+Troubleshoot distances
+
+```{r}
+trk_flgs <- track_ordered %>%
+  mutate(
+    flag_over2500 = if_else(ant_2_pos > 2500, 1, 0),
+    flag_very_high = if_else(ant_2_pos > 10000, 1, 0)
+    ) %>%
+  group_by(DesignId, dateFlown, ReplicateNumber) %>%
+  mutate(
+    flag_2500_cnt = sum(flag_over2500),
+    flag_high_cnt = sum(flag_very_high)
+  ) %>%
+  filter( flag_2500_cnt > 0 )
+```
+
